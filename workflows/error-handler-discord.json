@@ -1,0 +1,96 @@
+{
+  "name": "FiveCardGuys - Error Handler (Discord)",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Error Handler (two-tier Discord alerting)\nFires on ANY failure in the main pipeline. Classifies normal failures vs the partial-success case (blog created, email failed).\nDiscord webhook URL + the retry-count-cap logic (see Code node).",
+        "height": 236,
+        "width": 704,
+        "color": 5
+      },
+      "id": "d0cfdc8a-4834-42db-b99a-8640e5a8db98",
+      "name": "README_ERR",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        80,
+        96
+      ]
+    },
+    {
+      "parameters": {},
+      "id": "7fe86ced-bb8c-467b-a4cb-5da64b5334e1",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        144,
+        -80
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// === Format the Discord alert + classify severity ===\nconst e = $input.first().json;\nconst wf       = e.workflow ? e.workflow.name : 'unknown workflow';\nconst execId   = e.execution ? e.execution.id : 'n/a';\nconst execUrl  = e.execution && e.execution.url ? e.execution.url : '';\nconst lastNode = e.execution && e.execution.lastNodeExecuted\n  ? e.execution.lastNodeExecuted : 'unknown node';\nconst msg = (e.execution && e.execution.error && e.execution.error.message)\n  ? e.execution.error.message : 'No message';\n\n// Partial-success case: blog draft created but newsletter email failed.\nlet tier = '\\uD83D\\uDFE0 [WORKFLOW] Pipeline run failed.';\nif (lastNode === 'Email newsletter draft to the host')\n  tier = '\\uD83D\\uDFE0 [WORKFLOW - PARTIAL] Blog draft was created but the newsletter '\n       + 'email failed. Episode NOT marked done -- it will retry next run.';\nelse if (lastNode === 'Retry cap alert')\n  tier = '\\uD83D\\uDD34 [STUCK EPISODE] Retry cap hit -- needs manual attention. Will not retry again.';\n\nconst content = tier\n  + '\\n**Workflow:** ' + wf\n  + '\\n**Failed node:** ' + lastNode\n  + '\\n**Error:** ' + msg\n  + '\\n**Execution:** ' + (execUrl || execId)\n  + '\\n**Time:** ' + new Date().toISOString();\n\nreturn [{ json: { content } }];\n"
+      },
+      "id": "36d80a77-d800-4930-a3a7-11b80176d92c",
+      "name": "Format Discord alert",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        368,
+        -80
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://discord.com/api/webhooks/YOUR_WEBHOOK",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ content: $json.content }) }}",
+        "options": {}
+      },
+      "id": "ee5b9102-fe59-4bf0-8310-e9557a8bc141",
+      "name": "Send Discord alert",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        592,
+        -80
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 4000
+    }
+  ],
+  "connections": {
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Format Discord alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Discord alert": {
+      "main": [
+        [
+          {
+            "node": "Send Discord alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false
+  }
+}

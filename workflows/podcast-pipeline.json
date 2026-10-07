@@ -1,0 +1,1309 @@
+{
+  "name": "FiveCardGuys - Podcast to Blog + Newsletter (Phase 1)",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "cronExpression",
+              "expression": "0 6,18 * * *"
+            }
+          ]
+        }
+      },
+      "id": "f47d414d-942c-4c9f-b924-b790771c28aa",
+      "name": "Schedule Trigger (6am / 6pm)",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        3264,
+        2640
+      ]
+    },
+    {
+      "parameters": {
+        "url": "https://example.com/podcast/rss",
+        "options": {}
+      },
+      "id": "f4d55741-db76-433f-abcd-699d19c69e77",
+      "name": "Read podcast RSS feed",
+      "type": "n8n-nodes-base.rssFeedRead",
+      "typeVersion": 1.1,
+      "position": [
+        3488,
+        2640
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// === Back-catalogue guard + episode filter (FAIL-SAFE) ===\n// Prevents transcribing all 312 episodes on first run, and skips trailers/shorts.\nconst MAX_AGE_DAYS     = 7;   // only consider episodes published in the last N days\nconst MIN_DURATION_SEC = 600; // skip anything shorter than N seconds (trailers/shorts)\nconst MAX_PER_RUN      = 1;   // hard cap on episodes processed per run\n\nconst now = Date.now();\nconst kept = [];\n\nfor (const it of $input.all()) {\n  const d = it.json;\n  // RSS Read field names vary by feed -- adjust if your feed differs:\n  const pubDate = d.isoDate || d.pubDate || d.published;\n  const guid    = d.guid || d.id || d.link;\n  const title   = d.title || '';\n  const enclosureUrl = (d.enclosure && d.enclosure.url) || d.enclosureUrl || d.link;\n\n  // duration may arrive as \"HH:MM:SS\", seconds, or under itunes:duration\n  let durationSec = 0;\n  const rawDur = d['itunes:duration'] || d.duration;\n  if (typeof rawDur === 'number') durationSec = rawDur;\n  else if (typeof rawDur === 'string' && rawDur.includes(':'))\n    durationSec = rawDur.split(':').map(Number).reduce((a,b)=>a*60+b,0);\n  else if (rawDur) durationSec = Number(rawDur) || 0;\n\n  const ageDays = pubDate ? (now - new Date(pubDate).getTime())/86400000 : 999;\n  if (ageDays > MAX_AGE_DAYS) continue;\n  if (durationSec && durationSec < MIN_DURATION_SEC) continue;\n  if (!guid || !enclosureUrl) continue;\n\n  kept.push({ json: {\n    guid, title, enclosureUrl, durationSec, pubDate,\n    status: 'processing',\n    claimed_at: new Date().toISOString(),\n    retry_count: 0,\n    error_note: ''\n  }});\n}\n\nkept.sort((a,b) => new Date(b.json.pubDate) - new Date(a.json.pubDate));\nreturn kept.slice(0, MAX_PER_RUN);"
+      },
+      "id": "9b2c7d99-faf4-4c8a-8cb3-8487a453c20d",
+      "name": "Filter to recent episodes",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3712,
+        2640
+      ]
+    },
+    {
+      "parameters": {
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_SHEET_ID",
+          "mode": "list",
+          "cachedResultName": "FCG Podcast Tracker",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 1561926353,
+          "mode": "list",
+          "cachedResultName": "test",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID/edit#gid=0"
+        },
+        "options": {}
+      },
+      "id": "d3364190-5c67-4070-8d57-3da46e3052f5",
+      "name": "Read processed-episode log",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        3936,
+        2640
+      ],
+      "retryOnFail": true,
+      "maxTries": 4,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "REPLACE_ME"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// === Idempotency gate (FAIL-SAFE backbone) ===\n// One ledger row per guid. retry_count on that row = attempts so far.\nconst rows = $input.all().map(i => i.json);\nconst cand = $('Filter to recent episodes').first();\nif (!cand) return [];\n\nconst guid = String(cand.json.guid);\nconst mine = rows.filter(r => String(r.guid || r.GUID || '') === guid);\nconst st = r => String(r.status || '').toLowerCase();\n\nif (mine.some(r => st(r) === 'done')) return [];             // already published\nif (mine.some(r => st(r) === 'failed-permanent')) return []; // already alerted -> stay quiet\n\n// Attempts so far. Legacy duplicate rows still count 1 each.\nconst attempts = Math.max(mine.length, ...mine.map(r => Number(r.retry_count) || 0));\n\nconst RETRY_CAP = 3;\nif (attempts >= RETRY_CAP) {\n  // Routed to the alert branch by the IF node. Fires once; the row then blocks future runs.\n  return [{ json: { ...cand.json, status: 'failed-permanent', retry_count: attempts,\n    error_note: 'Retry cap (' + RETRY_CAP + ') hit ' + new Date().toISOString() } }];\n}\n\n// New or retryable: claim with incremented count (Claim node upserts on guid).\nreturn [{ json: { ...cand.json, status: 'processing', retry_count: attempts + 1,\n  claimed_at: new Date().toISOString(), error_note: '' } }];"
+      },
+      "id": "2f489e7d-2d83-42d1-96ed-840aa9c64b3f",
+      "name": "Check if new (idempotency gate)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4160,
+        2640
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_SHEET_ID",
+          "mode": "list",
+          "cachedResultName": "FCG Podcast Tracker",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 1561926353,
+          "mode": "list",
+          "cachedResultName": "tracker",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [
+            "guid"
+          ],
+          "schema": [
+            {
+              "id": "guid",
+              "displayName": "guid",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "title",
+              "displayName": "title",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "claimed_at",
+              "displayName": "claimed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "completed_at",
+              "displayName": "completed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "wp_post_id",
+              "displayName": "wp_post_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "retry_count",
+              "displayName": "retry_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "error_note",
+              "displayName": "error_note",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "enclosureUrl",
+              "displayName": "enclosureUrl",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "durationSec",
+              "displayName": "durationSec",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "pubDate",
+              "displayName": "pubDate",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "67550229-abbe-4a5d-9328-46938945bd63",
+      "name": "Claim episode (write 'processing')",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        4608,
+        2544
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "REPLACE_ME"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "HEAD",
+        "url": "={{ $('Check if new (idempotency gate)').first().json.enclosureUrl }}",
+        "options": {
+          "redirect": {
+            "redirect": {}
+          },
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          }
+        }
+      },
+      "id": "6cbbb818-0ddd-4ffb-9442-3a5e2dcd6e0d",
+      "name": "Validate audio URL (HEAD)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4832,
+        2544
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "jsCode": "// === Audio validation gate (FAIL-CLOSED) ===\n// Confirms the resolved enclosure URL is reachable and looks like audio\n// BEFORE we spend a transcription call. Throws -> Error Workflow on failure.\nconst r = $input.first().json;\nconst status = r.statusCode || (r.headers ? 200 : 0);\nconst ct = (r.headers && (r.headers['content-type'] || r.headers['Content-Type'])) || '';\n\nif (status && status >= 400)\n  throw new Error('Audio URL returned HTTP ' + status + ' -- failing closed.');\nif (ct && !String(ct).toLowerCase().includes('audio'))\n  throw new Error('Audio URL content-type not audio: \"' + ct + '\" -- failing closed.');\n\n// Forward the episode candidate (HTTP node replaced the item, so re-fetch it).\nreturn [ $('Check if new (idempotency gate)').first() ];\n"
+      },
+      "id": "36f7620a-3a77-404e-92c5-948307ce42d8",
+      "name": "Check audio is reachable",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5056,
+        2544
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const a = $json; // AssemblyAI completed transcript response\nconst text = a.text || '';\nconst durationSec = a.audio_duration\n  || $('Check if new (idempotency gate)').first().json.durationSec\n  || 0;\n\nif (!text || text.trim().length < 50)\n  throw new Error('Transcript empty / near-empty -- failing closed.');\n\nconst MIN_CHARS_PER_MIN = 300;\nif (durationSec > 0) {\n  const cpm = text.length / (durationSec / 60);\n  if (cpm < MIN_CHARS_PER_MIN)\n    throw new Error('Transcript suspiciously short (' + Math.round(cpm)\n      + ' chars/min) -- possible truncation. Failing closed.');\n}\n\nreturn [{ json: { transcript: text, durationSec } }];"
+      },
+      "id": "cf9c238f-ec88-4ce3-a786-1da14f8f0b92",
+      "name": "Validate transcript length",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6400,
+        2448
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// === Build the Claude request (voice and style guide removed from this copy) ===\nconst ep = $('Check if new (idempotency gate)').first().json;\nconst transcript = $('Validate transcript length').first().json.transcript;\nconst SYSTEM = [\n  // The client's voice and style guide is removed from this showcase copy.\n  // The production prompt sets the voice, the structure of the blog post and\n  // the newsletter blurb, and a list of things not to do.\n  'You are the editorial voice of the podcast. From the transcript, write (1) a blog post and (2) a short newsletter blurb that teases the post.',\n  '',\n  '[VOICE AND STYLE GUIDE REMOVED]',\n  '',\n  'DO NOT',\n  '- Do not invent facts, sales, or quotes not in the transcript.',\n  '',\n  'Return your output in exactly this format, with no other text before or after:',\n  '<blog_title>...</blog_title>',\n  '<blog_meta>...</blog_meta>',\n  '<blog_body>...</blog_body>',\n  '<newsletter_blurb>...</newsletter_blurb>',\n  'blog_body contains raw HTML. Do not escape anything. Do not use JSON.'\n].join('\\n');\nconst USER = 'Episode title: ' + ep.title + '\\n\\nTranscript:\\n' + transcript;\nreturn [{ json: {\n  model: 'claude-sonnet-4-6',\n  max_tokens: 8192,\n  system: SYSTEM,\n  messages: [{ role: 'user', content: USER }]\n}}];"
+      },
+      "id": "1befcec9-4193-42ff-928e-5782ceff98a1",
+      "name": "Build Claude prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6624,
+        2448
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anthropic.com/v1/messages",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "anthropic-version",
+              "value": "2023-06-01"
+            },
+            {
+              "name": "content-type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $json.model, max_tokens: $json.max_tokens, system: $json.system, messages: $json.messages }) }}",
+        "options": {}
+      },
+      "id": "3500ea78-05f1-49f8-8939-58101fc38e9c",
+      "name": "Claude - generate blog + newsletter",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        6848,
+        2448
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "REPLACE_ME"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const d = $json;\nlet raw = '';\nif (Array.isArray(d.content))\n  raw = d.content.filter(b => b.type === 'text').map(b => b.text).join('\\n');\nelse if (typeof d.completion === 'string') raw = d.completion;\nelse raw = JSON.stringify(d);\n\nfunction extract(tag) {\n  const m = raw.match(new RegExp('<' + tag + '>([\\\\s\\\\S]*?)</' + tag + '>'));\n  return m ? m[1].trim() : '';\n}\n\nconst parsed = {\n  blog_title:       extract('blog_title'),\n  blog_meta:        extract('blog_meta'),\n  blog_body:        extract('blog_body'),\n  newsletter_blurb: extract('newsletter_blurb')\n};\n\nfor (const k of ['blog_title','blog_meta','blog_body','newsletter_blurb']) {\n  if (!parsed[k])\n    throw new Error('Missing/empty field: ' + k + ' -- failing closed. Tail: ' + raw.slice(-300));\n}\n\nparsed.guid = $('Check if new (idempotency gate)').first().json.guid;\nreturn [{ json: parsed }];"
+      },
+      "id": "6941a3b2-de00-4ac5-884e-656c06d6a011",
+      "name": "Parse & validate Claude JSON",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7072,
+        2448
+      ]
+    },
+    {
+      "parameters": {
+        "title": "={{ $json.blog_title }}",
+        "additionalFields": {
+          "content": "={{ $json.blog_body }}",
+          "status": "draft"
+        }
+      },
+      "id": "12a65527-e541-49f4-9b92-c97d45123d17",
+      "name": "WordPress - create draft",
+      "type": "n8n-nodes-base.wordpress",
+      "typeVersion": 1,
+      "position": [
+        3264,
+        2224
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "wordpressApi": {
+          "id": "REPLACE_ME",
+          "name": "REPLACE_ME"
+        }
+      },
+      "disabled": true
+    },
+    {
+      "parameters": {
+        "jsCode": "// === Build done-row (WORKAROUND MODE: email-only, no WP API) ===\n// WordPress REST API is blocked by SiteGround; blog is emailed to the host to\n// paste manually. \"done\" here means \"drafts emailed to the host\", consistent\n// with how the Substack newsletter already works. No wp_post_id available.\nreturn [{ json: {\n  guid: $('Parse & validate Claude JSON').first().json.guid,\n  status: 'done',\n  wp_post_id: 'MANUAL-EMAIL',   // sentinel: paste-mode, not API-created\n  completed_at: new Date().toISOString()\n}}];"
+      },
+      "id": "376c1df5-7310-431d-82b4-e4fa0c1f931d",
+      "name": "Prepare done-row",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7968,
+        2448
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_SHEET_ID",
+          "mode": "list",
+          "cachedResultName": "FCG Podcast Tracker",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 1561926353,
+          "mode": "list",
+          "cachedResultName": "tracker",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [
+            "guid"
+          ],
+          "schema": [
+            {
+              "id": "guid",
+              "displayName": "guid",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "title",
+              "displayName": "title",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "claimed_at",
+              "displayName": "claimed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "completed_at",
+              "displayName": "completed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "wp_post_id",
+              "displayName": "wp_post_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "retry_count",
+              "displayName": "retry_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "error_note",
+              "displayName": "error_note",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "enclosureUrl",
+              "displayName": "enclosureUrl",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "durationSec",
+              "displayName": "durationSec",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "pubDate",
+              "displayName": "pubDate",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "row_number",
+              "displayName": "row_number",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "canBeUsedToMatch": true,
+              "readOnly": true,
+              "removed": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "5d33a1dc-9b7d-4885-b9ce-9c53f7e4facd",
+      "name": "Mark episode done",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [
+        8192,
+        2448
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "REPLACE_ME"
+        }
+      }
+    },
+    {
+      "parameters": {},
+      "id": "4143a5c7-5e03-4e3f-9bb8-572dbec864f9",
+      "name": "End",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [
+        8416,
+        2448
+      ]
+    },
+    {
+      "parameters": {
+        "amount": 30
+      },
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        5504,
+        2544
+      ],
+      "id": "b222cf90-bd7c-4a1a-9c44-b85c1d9e0c74",
+      "name": "Wait before poll"
+    },
+    {
+      "parameters": {
+        "url": "=https://api.assemblyai.com/v2/transcript/{{ $('AssemblyAI - submit transcript').first().json.id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        5728,
+        2480
+      ],
+      "id": "09a9bb88-b873-4b9c-be98-d4df07653220",
+      "name": "Check transcript status",
+      "retryOnFail": true,
+      "waitBetweenTries": 3000,
+      "maxTries": 3,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "REPLACE_ME"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.assemblyai.com/v2/transcript",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={ \"audio_url\": \"{{ $('Check if new (idempotency gate)').first().json.enclosureUrl }}\", \"speech_models\": [\"universal-2\"], \"speaker_labels\": true }",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [
+        5280,
+        2544
+      ],
+      "id": "b3bfb371-8fe6-44fb-ab72-c5e2bace5bfd",
+      "name": "AssemblyAI - submit transcript",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_ME",
+          "name": "REPLACE_ME"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// === Poll counter (FAIL-CLOSED: cap retries so a stuck job can't loop forever) ===\nconst MAX_POLLS = 40; // 40 x 30s wait = ~20 min ceiling (60-90 min episodes need headroom)\n\nconst current = $input.first().json; // latest GET response (status, text, audio_duration, etc.)\n\n// Read the count from THIS node's own previous run, not from the GET response,\n// since the GET response never carries pollCount across loop iterations.\nlet prevCount = 0;\ntry {\n  prevCount = $('Poll counter (fail-closed)').first().json.pollCount || 0;\n} catch (e) {\n  prevCount = 0; // first time through the loop, no previous run exists yet\n}\n\nconst pollCount = prevCount + 1;\n\nif (pollCount > MAX_POLLS) {\n  throw new Error('AssemblyAI transcription exceeded poll ceiling (' + MAX_POLLS\n    + ' attempts, ~20 min) — failing closed. Transcript ID: '\n    + ($('AssemblyAI - submit transcript').first().json.id || 'unknown'));\n}\n\nreturn [{ json: { ...current, pollCount } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        5952,
+        2480
+      ],
+      "id": "71df31b2-5686-4a7a-a49f-76eeaf27d5a0",
+      "name": "Poll counter (fail-closed)"
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "af1a0e3a-0add-4ba8-90db-884ac44d1f09",
+                    "leftValue": "={{ $json.status }}",
+                    "rightValue": "completed",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "leftValue": "",
+                  "typeValidation": "loose",
+                  "version": 3
+                },
+                "conditions": [
+                  {
+                    "id": "5b5a9d70-43fb-411f-8cbc-12527bc947ac",
+                    "leftValue": "={{ $json.status }}",
+                    "rightValue": "error",
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    }
+                  }
+                ],
+                "combinator": "and"
+              }
+            }
+          ]
+        },
+        "looseTypeValidation": true,
+        "options": {
+          "fallbackOutput": "extra"
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.4,
+      "position": [
+        6176,
+        2528
+      ],
+      "id": "bb4d70f4-8be8-43c4-a319-1619e89c7d90",
+      "name": "Route on transcript status",
+      "retryOnFail": false
+    },
+    {
+      "parameters": {
+        "jsCode": "// === AssemblyAI returned status='error' -> fail closed into the Error Handler ===\nconst e = $input.first().json;\nthrow new Error('AssemblyAI transcription failed: '\n  + (e.error || 'unknown error')\n  + ' (transcript id: ' + (e.id || 'unknown') + ')');"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        6400,
+        2640
+      ],
+      "id": "26e73405-0e01-4570-9802-06640214411d",
+      "name": "Throw AssemblyAI error"
+    },
+    {
+      "parameters": {
+        "sendTo": "host@example.com",
+        "subject": "=[Cards To The Moon] Newsletter draft ready — {{ $('Check if new (idempotency gate)').first().json.title }}",
+        "message": "={{ $('Parse & validate Claude JSON').first().json.newsletter_blurb }}",
+        "options": {
+          "ccList": "host@example.com"
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        7744,
+        2448
+      ],
+      "id": "1d0b7cc6-f52f-4ad0-b41e-f848fbaf4772",
+      "name": "Email newsletter draft to the host",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_ME",
+          "name": "REPLACE_ME"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// === Build the paste-ready blog email (workaround mode) ===\n// SiteGround SG-CAPTCHA is blocking the WP REST API, so instead of creating\n// a draft via API we email the host the raw HTML to paste into WordPress manually.\n// Sent as PLAIN TEXT so the HTML source is copyable (not rendered away).\nconst p = $('Parse & validate Claude JSON').first().json;\n\nconst body =\n  'New blog draft ready to paste into WordPress.\\n\\n' +\n  '=== TITLE (paste into the title field) ===\\n' +\n  p.blog_title + '\\n\\n' +\n  '=== META DESCRIPTION (Yoast/SEO field) ===\\n' +\n  p.blog_meta + '\\n\\n' +\n  '=== BLOG BODY (paste into the WordPress editor in \"Code\"/HTML mode) ===\\n' +\n  p.blog_body + '\\n\\n' +\n  '--- how to paste ---\\n' +\n  '1. New Post in WordPress.\\n' +\n  '2. Switch the editor to Code/HTML view (the ⋮ menu > Code editor).\\n' +\n  '3. Paste the BLOG BODY section above.\\n' +\n  '4. Switch back to Visual view, add title + meta, save as Draft.\\n';\n\nreturn [{ json: {\n  guid: p.guid,\n  blog_email_subject: '[Cards To The Moon] Blog draft ready to paste — ' + p.blog_title,\n  blog_email_body: body\n}}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        7296,
+        2448
+      ],
+      "id": "fcfbfa08-fb10-456b-ac04-cfc86f826c35",
+      "name": "[WORKAROUND] Build blog email"
+    },
+    {
+      "parameters": {
+        "sendTo": "host@example.com",
+        "subject": "={{ $json.blog_email_subject }}",
+        "emailType": "text",
+        "message": "={{ $json.blog_email_body }}",
+        "options": {
+          "ccList": "host@example.com"
+        }
+      },
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.2,
+      "position": [
+        7520,
+        2448
+      ],
+      "id": "43cafb28-7e52-481d-8fe4-45c4f31bc995",
+      "name": "[WORKAROUND] Email blog draft to the host",
+      "retryOnFail": true,
+      "waitBetweenTries": 5000,
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "REPLACE_ME",
+          "name": "REPLACE_ME"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 3
+          },
+          "conditions": [
+            {
+              "id": "a335147c-0e8d-43de-9575-77fa30543c11",
+              "leftValue": "={{ $json.status }}",
+              "rightValue": "failed-permanent",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [
+        4384,
+        2640
+      ],
+      "id": "e4286de7-0f3e-4232-8546-e2c56f5533a4",
+      "name": "Retry cap hit?"
+    },
+    {
+      "parameters": {
+        "operation": "appendOrUpdate",
+        "documentId": {
+          "__rl": true,
+          "value": "YOUR_SHEET_ID",
+          "mode": "list",
+          "cachedResultName": "FCG Podcast Tracker",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID/edit?usp=drivesdk"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": 1561926353,
+          "mode": "list",
+          "cachedResultName": "tracker",
+          "cachedResultUrl": "https://docs.google.com/spreadsheets/d/YOUR_SHEET_ID/edit#gid=0"
+        },
+        "columns": {
+          "mappingMode": "autoMapInputData",
+          "value": {},
+          "matchingColumns": [
+            "guid"
+          ],
+          "schema": [
+            {
+              "id": "guid",
+              "displayName": "guid",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true,
+              "removed": false
+            },
+            {
+              "id": "title",
+              "displayName": "title",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "claimed_at",
+              "displayName": "claimed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "completed_at",
+              "displayName": "completed_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "wp_post_id",
+              "displayName": "wp_post_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "retry_count",
+              "displayName": "retry_count",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "error_note",
+              "displayName": "error_note",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "enclosureUrl",
+              "displayName": "enclosureUrl",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "durationSec",
+              "displayName": "durationSec",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            },
+            {
+              "id": "pubDate",
+              "displayName": "pubDate",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "canBeUsedToMatch": true
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.7,
+      "position": [
+        4608,
+        2736
+      ],
+      "id": "b9129967-8a3d-462a-a876-da8cb1cc712e",
+      "name": "Mark failed-permanent",
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "REPLACE_ME",
+          "name": "REPLACE_ME"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const ep = $('Check if new (idempotency gate)').first().json;\nthrow new Error('Episode \"' + ep.title + '\" (guid ' + ep.guid + ') failed '\n  + ep.retry_count + ' times. Marked failed-permanent, will not retry. '\n  + 'To retry after fixing: delete its row in the ledger.');"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4832,
+        2736
+      ],
+      "id": "25e10823-6fc2-4432-be7d-358f0895ed8f",
+      "name": "Retry cap alert"
+    }
+  ],
+  "connections": {
+    "Schedule Trigger (6am / 6pm)": {
+      "main": [
+        [
+          {
+            "node": "Read podcast RSS feed",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read podcast RSS feed": {
+      "main": [
+        [
+          {
+            "node": "Filter to recent episodes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter to recent episodes": {
+      "main": [
+        [
+          {
+            "node": "Read processed-episode log",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read processed-episode log": {
+      "main": [
+        [
+          {
+            "node": "Check if new (idempotency gate)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check if new (idempotency gate)": {
+      "main": [
+        [
+          {
+            "node": "Retry cap hit?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim episode (write 'processing')": {
+      "main": [
+        [
+          {
+            "node": "Validate audio URL (HEAD)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate audio URL (HEAD)": {
+      "main": [
+        [
+          {
+            "node": "Check audio is reachable",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check audio is reachable": {
+      "main": [
+        [
+          {
+            "node": "AssemblyAI - submit transcript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate transcript length": {
+      "main": [
+        [
+          {
+            "node": "Build Claude prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Claude prompt": {
+      "main": [
+        [
+          {
+            "node": "Claude - generate blog + newsletter",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claude - generate blog + newsletter": {
+      "main": [
+        [
+          {
+            "node": "Parse & validate Claude JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse & validate Claude JSON": {
+      "main": [
+        [
+          {
+            "node": "[WORKAROUND] Build blog email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "WordPress - create draft": {
+      "main": [
+        []
+      ]
+    },
+    "Prepare done-row": {
+      "main": [
+        [
+          {
+            "node": "Mark episode done",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark episode done": {
+      "main": [
+        [
+          {
+            "node": "End",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait before poll": {
+      "main": [
+        [
+          {
+            "node": "Check transcript status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check transcript status": {
+      "main": [
+        [
+          {
+            "node": "Poll counter (fail-closed)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "AssemblyAI - submit transcript": {
+      "main": [
+        [
+          {
+            "node": "Wait before poll",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Poll counter (fail-closed)": {
+      "main": [
+        [
+          {
+            "node": "Route on transcript status",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route on transcript status": {
+      "main": [
+        [
+          {
+            "node": "Validate transcript length",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Throw AssemblyAI error",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Wait before poll",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Email newsletter draft to the host": {
+      "main": [
+        [
+          {
+            "node": "Prepare done-row",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "[WORKAROUND] Build blog email": {
+      "main": [
+        [
+          {
+            "node": "[WORKAROUND] Email blog draft to the host",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "[WORKAROUND] Email blog draft to the host": {
+      "main": [
+        [
+          {
+            "node": "Email newsletter draft to the host",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Retry cap hit?": {
+      "main": [
+        [
+          {
+            "node": "Mark failed-permanent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Claim episode (write 'processing')",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark failed-permanent": {
+      "main": [
+        [
+          {
+            "node": "Retry cap alert",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "binaryMode": "separate",
+    "availableInMCP": false,
+    "timeSavedMode": "fixed",
+    "callerPolicy": "workflowsFromSameOwner",
+    "errorWorkflow": "REPLACE_WITH_ERROR_WORKFLOW_ID"
+  }
+}
