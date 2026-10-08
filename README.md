@@ -31,7 +31,7 @@ flowchart TD
 
 ## Reliability decisions
 
-- One ledger row per episode — nothing is processed twice, and a run that dies half way can be picked up
+- One ledger row per episode — nothing is processed twice, and a run that dies halfway can be picked up
 - Checks before paid calls — the audio link and the transcript length are checked before anything is sent to Claude
 - Fail-closed validation — if Claude's output doesn't parse, the run stops, nothing half-finished is emailed
 - Retries — set on 11 external calls
@@ -41,7 +41,7 @@ flowchart TD
 ## Things that went wrong
 
 - The client's host blocked the WordPress API. The WordPress node is still in the workflow, switched off. The workaround emails a paste-ready blog draft instead.
-- Two production failures in the first week (a parser that broke on HTML output, and a setting n8n dropped). Both fixed, and the parser was rewritten to fail closed.
+- Two production failures in the first week (a parser that broke on HTML output, and a node setting that n8n reset). Both fixed, and the parser was rewritten to fail closed.
 
 ## Services
 
