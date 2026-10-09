@@ -4,7 +4,7 @@ A scheduled n8n workflow that turns each new podcast episode into a blog draft a
 
 Built for FiveCardGuys, a sports card and TCG podcast with a large back catalogue and no way to turn episodes into written content. Shared with the client's permission.
 
-**Status:** live in the client's n8n since July 2026. 16 episodes processed as of September 2026.
+**Status:** live in the client's n8n since July 2026.
 
 This repo is a showcase copy. Credentials, IDs, email addresses and the feed URL are replaced with placeholders, and the client's voice and style guide is taken out of the Claude prompt, so it won't run as is.
 
