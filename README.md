@@ -2,7 +2,7 @@
 
 A scheduled n8n workflow that turns each new podcast episode into a blog draft and a newsletter draft, and emails both to the host to edit.
 
-Built for FiveCardGuys, a sports card and TCG podcast with a large back catalogue and no way to turn episodes into written content. Shared with the client's permission.
+Built for Cards To The Moon Podcast, a sports card and TCG podcast with a large back catalogue and no way to turn episodes into written content. Shared with the client's permission.
 
 **Status:** live in the client's n8n since July 2026.
 
