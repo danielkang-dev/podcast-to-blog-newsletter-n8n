@@ -8,6 +8,10 @@ Built for Cards To The Moon Podcast, a sports card and TCG podcast with a large 
 
 This repo is a showcase copy. Credentials, IDs, email addresses and the feed URL are replaced with placeholders, and the client's voice and style guide is taken out of the Claude prompt, so it won't run as is.
 
+![n8n executions list: scheduled runs of the podcast workflow and the error handler](docs/n8n-runs.png)
+
+*Live runs in the client's n8n, Sep 2026. Each error run triggered the separate error workflow.*
+
 ## What it does
 
 ```mermaid
